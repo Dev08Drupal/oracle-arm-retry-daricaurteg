@@ -1,1 +1,89 @@
+name: Reintento Oracle ARM
 
+on:
+  schedule:
+    # Corre cada 10 minutos. GitHub puede retrasarlo un poco, es normal.
+    - cron: "*/10 * * * *"
+  workflow_dispatch: {}  # te permite correrlo manualmente desde la pestaña Actions
+
+permissions:
+  contents: write  # necesario para comitear state.json de vuelta al repo
+
+jobs:
+  intentar-crear-instancia:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Clonar repositorio
+        uses: actions/checkout@v4
+        with:
+          # Evita quedar en "detached HEAD", para que el push posterior
+          # apunte correctamente a la rama del repo.
+          ref: ${{ github.ref_name }}
+
+      - name: Configurar Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Instalar dependencias
+        run: pip install oci
+
+      - name: Intentar crear la instancia ARM
+        id: intento
+        env:
+          OCI_USER_OCID: ${{ secrets.OCI_USER_OCID }}
+          OCI_FINGERPRINT: ${{ secrets.OCI_FINGERPRINT }}
+          OCI_TENANCY_OCID: ${{ secrets.OCI_TENANCY_OCID }}
+          OCI_REGION: ${{ secrets.OCI_REGION }}
+          OCI_SUBNET_OCID: ${{ secrets.OCI_SUBNET_OCID }}
+          OCI_PRIVATE_KEY: ${{ secrets.OCI_PRIVATE_KEY }}
+          OCI_AVAILABILITY_DOMAIN: ${{ secrets.OCI_AVAILABILITY_DOMAIN }}
+          OCI_SSH_PUBLIC_KEY: ${{ secrets.OCI_SSH_PUBLIC_KEY }}
+          OCI_INSTANCE_NAME: "pasatedigital"
+          OCI_OCPUS: "4"
+          OCI_MEMORY_GB: "24"
+          OCI_BOOT_VOLUME_GB: "50"
+          GMAIL_ADDRESS: ${{ secrets.GMAIL_ADDRESS }}
+          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+          NOTIFY_EMAIL_TO: ${{ secrets.NOTIFY_EMAIL_TO }}
+          STATE_FILE_PATH: ${{ github.workspace }}/state.json
+        # continue-on-error: el script termina con exit 1 en casos esperados
+        # ("sin capacidad todavía"), eso no debe marcar el workflow como roto.
+        continue-on-error: true
+        working-directory: scripts
+        run: python create_instance.py
+
+      - name: Verificar contenido de state.json (diagnóstico)
+        run: |
+          echo "--- Árbol completo del repo (sin .git) ---"
+          find . -path ./.git -prune -o -type f -print
+          echo ""
+          echo "--- ls -la en la raíz ---"
+          ls -la
+          echo ""
+          echo "--- ls -la en scripts/ ---"
+          ls -la scripts/
+          echo ""
+          echo "--- Contenido de ./state.json (raíz) ---"
+          cat ./state.json 2>/dev/null || echo "⚠️ No existe ./state.json"
+          echo ""
+          echo "--- Contenido de ./scripts/state.json (si existe) ---"
+          cat ./scripts/state.json 2>/dev/null || echo "(no existe scripts/state.json, esto es correcto)"
+
+      - name: Guardar estado actualizado (state.json)
+        if: always()
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          echo "--- git status ---"
+          git status
+
+          if [[ -n "$(git status --porcelain state.json 2>/dev/null)" ]]; then
+            git add state.json
+            git commit -m "chore: actualizar estado de reintento"
+            git push origin HEAD:${{ github.ref_name }}
+            echo "✅ Push realizado."
+          else
+            echo "⚠️ Sin cambios detectados en state.json, no se hizo commit."
+          fi
