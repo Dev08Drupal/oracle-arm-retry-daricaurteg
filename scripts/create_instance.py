@@ -4,15 +4,19 @@ Script que intenta crear una instancia VM.Standard.A1.Flex (ARM, Always Free)
 en Oracle Cloud. Pensado para correr repetidamente desde GitHub Actions hasta
 que Oracle tenga capacidad disponible.
 
-Ahora valida MÚLTIPLES dominios de disponibilidad (AD) dentro de la misma
-región: si el AD 1 no tiene capacidad, prueba el AD 2, luego el AD 3, etc.
-Solo se rinde (exit code 1, para que el cron reintente en 10 min) si NINGÚN
-AD tuvo capacidad en esta corrida.
+Valida MÚLTIPLES dominios de disponibilidad (AD) dentro de la misma región:
+si el AD 1 no tiene capacidad, prueba el AD 2, luego el AD 3, etc. Solo se
+rinde (exit code 1, para que el cron reintente en 10 min) si NINGÚN AD tuvo
+capacidad en esta corrida.
 
-Envía 3 tipos de correo (vía scripts/notify.py):
-- Inicio: una sola vez, en la primera corrida del workflow.
+Envía 3 tipos de correo (vía scripts/notify.py), todos con la región en el
+asunto:
+- Primer correo ("inicio"): una sola vez, en la primera corrida del workflow.
+  Incluye el detalle de qué pasó en CADA uno de los AD probados, para que
+  puedas confirmar que el script efectivamente recorrió los 3 dominios.
 - Resumen: cada ~12 horas mientras sigue intentando, con el número de intentos.
-- Éxito: cuando la instancia se crea (incluye OCID e IP, y también cierra el flujo).
+- Éxito: cuando la instancia se crea (incluye OCID, AD usado e IP, y también
+  cierra el flujo).
 
 El estado entre corridas (si ya se envió el correo de inicio, cuántos intentos
 van, etc.) se guarda en scripts/state.py / state.json, que el workflow de
@@ -54,8 +58,8 @@ def get_env(name: str) -> str:
 
 def get_availability_domains() -> list:
     """
-    Lee OCI_AVAILABILITY_DOMAIN, que ahora puede contener uno o varios AD
-    separados por comas, ej: "XvQL:PHX-AD-1,XvQL:PHX-AD-2,XvQL:PHX-AD-3".
+    Lee OCI_AVAILABILITY_DOMAIN, que puede contener uno o varios AD separados
+    por comas, ej: "XvQL:PHX-AD-1,XvQL:PHX-AD-2,XvQL:PHX-AD-3".
     """
     raw = get_env("OCI_AVAILABILITY_DOMAIN")
     domains = [d.strip() for d in raw.split(",") if d.strip()]
@@ -146,15 +150,16 @@ def print_service_error_details(e: "oci.exceptions.ServiceError") -> None:
     print(f"request_endpoint: {getattr(e, 'request_endpoint', 'N/A')}")
 
 
-def send_success_email(instance, public_ip: str, state: dict) -> None:
-    subject = "✅ Tu instancia Oracle ARM ya está creada"
+def send_success_email(instance, public_ip: str, state: dict, region: str) -> None:
+    subject = f"✅ [{region}] Tu instancia Oracle ARM ya está creada"
     body = (
         "¡Buenas noticias! Tu instancia VM.Standard.A1.Flex (4 OCPU, 24GB RAM) "
         "ya fue creada en Oracle Cloud.\n\n"
+        f"Región: {region}\n"
         f"Nombre: {instance.display_name}\n"
         f"OCID: {instance.id}\n"
         f"Estado: {instance.lifecycle_state}\n"
-        f"Dominio de disponibilidad: {instance.availability_domain}\n"
+        f"Dominio de disponibilidad usado: {instance.availability_domain}\n"
         f"IP pública: {public_ip}\n\n"
         f"Intentos totales hasta lograrlo: {state['attempts']}\n\n"
         "Próximo paso: conéctate por SSH con tu clave privada:\n"
@@ -166,25 +171,40 @@ def send_success_email(instance, public_ip: str, state: dict) -> None:
     send_email(subject, body)
 
 
-def send_start_email(state: dict, domains: list) -> None:
-    subject = "🚀 Iniciando reintento automático de instancia Oracle ARM"
+def send_first_run_email(state: dict, region: str, domains: list, domain_results: list) -> None:
+    """
+    Correo de "inicio", enviado una sola vez, DESPUÉS del primer intento real.
+    Incluye el detalle de qué pasó en cada uno de los AD probados, para
+    confirmar que el script efectivamente recorrió todos los dominios
+    configurados (y no se quedó pegado en el primero).
+    """
+    subject = f"🚀 [{region}] Iniciando reintento automático de instancia Oracle ARM"
+
+    detalle_dominios = "\n".join(f"  - {ad}: {resultado}" for ad, resultado in domain_results)
+
     body = (
         "Se acaba de activar el proceso de reintento automático para crear tu "
         "instancia VM.Standard.A1.Flex (4 OCPU, 24GB RAM) en Oracle Cloud.\n\n"
-        f"El script intentará crear la instancia cada 10 minutos, probando "
-        f"estos dominios de disponibilidad en orden: {', '.join(domains)}\n\n"
+        f"Región: {region}\n"
+        f"Dominios de disponibilidad configurados: {', '.join(domains)}\n\n"
+        "Resultado del primer intento, dominio por dominio (esto confirma que "
+        "el script SÍ recorre todos los AD configurados):\n"
+        f"{detalle_dominios}\n\n"
         f"Hora de inicio (UTC): {state['started_at']}\n\n"
-        f"Recibirás un correo de resumen cada {SUMMARY_INTERVAL_HOURS} horas, "
-        "y un correo final cuando la instancia se cree con éxito."
+        "El script seguirá intentando cada 10 minutos, probando los mismos "
+        f"dominios en el mismo orden. Recibirás un correo de resumen cada "
+        f"{SUMMARY_INTERVAL_HOURS} horas, y un correo final cuando la "
+        "instancia se cree con éxito."
     )
     send_email(subject, body)
 
 
-def send_summary_email(state: dict) -> None:
+def send_summary_email(state: dict, region: str) -> None:
     elapsed = hours_since(state["started_at"])
-    subject = f"📊 Resumen: {state['attempts']} intentos en {elapsed:.1f}h"
+    subject = f"📊 [{region}] Resumen: {state['attempts']} intentos en {elapsed:.1f}h"
     body = (
         "Resumen del proceso de reintento automático de tu instancia Oracle ARM.\n\n"
+        f"Región: {region}\n"
         f"Tiempo transcurrido: {elapsed:.1f} horas\n"
         f"Intentos realizados: {state['attempts']}\n"
         "Estado: todavía sin capacidad disponible en Oracle (en ninguno de los "
@@ -195,7 +215,7 @@ def send_summary_email(state: dict) -> None:
     send_email(subject, body)
 
 
-def run_attempt(config: dict, state: dict, availability_domains: list):
+def run_attempt(config: dict, state: dict, availability_domains: list, region: str):
     """
     Ejecuta un intento completo: revisar si ya existe, buscar imagen, y luego
     intentar lanzar la instancia probando cada AD de la lista en orden hasta
@@ -212,6 +232,10 @@ def run_attempt(config: dict, state: dict, availability_domains: list):
     formato, etc.), se detiene inmediatamente y propaga ese error: no tiene
     sentido seguir probando otros AD si el problema es, por ejemplo, un
     subnet_id inválido.
+
+    Antes de terminar (por éxito o por agotar los AD), si es la primera
+    corrida del workflow, envía el correo de "inicio" con el detalle de qué
+    pasó en cada AD probado.
     """
     compartment_id = get_env("OCI_TENANCY_OCID")  # compartimento raíz
     subnet_id = get_env("OCI_SUBNET_OCID")
@@ -230,7 +254,7 @@ def run_attempt(config: dict, state: dict, availability_domains: list):
         print(f"La instancia '{display_name}' ya existe.")
         public_ip = get_public_ip(compute_client, network_client, compartment_id, existing.id)
         if not state["finished"]:
-            send_success_email(existing, public_ip, state)
+            send_success_email(existing, public_ip, state, region)
             state["finished"] = True
             save_state(state)
         sys.exit(0)
@@ -239,6 +263,7 @@ def run_attempt(config: dict, state: dict, availability_domains: list):
     print(f"Usando imagen: {image_id}")
 
     last_capacity_error = None
+    domain_results = []  # lista de tuplas (ad, "texto de qué pasó")
 
     for ad in availability_domains:
         print(f"--- Probando dominio de disponibilidad: {ad} ---")
@@ -273,10 +298,14 @@ def run_attempt(config: dict, state: dict, availability_domains: list):
             print(f"Estado: {instance.lifecycle_state}")
             print(f"AD usado: {ad}")
 
-            # La IP pública puede tardar unos segundos en estar lista en la
-            # VNIC; si no aparece todavía, el correo lo indica.
+            domain_results.append((ad, "✅ tenía capacidad, instancia creada aquí"))
+
+            if not state["start_email_sent"]:
+                send_first_run_email(state, region, availability_domains, domain_results)
+                state["start_email_sent"] = True
+
             public_ip = get_public_ip(compute_client, network_client, compartment_id, instance.id)
-            send_success_email(instance, public_ip, state)
+            send_success_email(instance, public_ip, state, region)
             state["finished"] = True
             save_state(state)
             sys.exit(0)
@@ -284,30 +313,41 @@ def run_attempt(config: dict, state: dict, availability_domains: list):
         except oci.exceptions.ServiceError as e:
             if is_out_of_capacity_error(e):
                 print(f"⏳ Sin capacidad en {ad}. Probando el siguiente dominio (si hay)...")
+                domain_results.append((ad, "⏳ sin capacidad"))
                 last_capacity_error = e
                 continue  # probar el siguiente AD
             else:
+                domain_results.append((ad, f"❌ error real: {e.code}"))
+                if not state["start_email_sent"]:
+                    send_first_run_email(state, region, availability_domains, domain_results)
+                    state["start_email_sent"] = True
                 # Error real (no de capacidad): no tiene sentido seguir
                 # probando otros AD, propagamos para que main() lo reporte.
                 raise
 
     # Si llegamos aquí, ningún AD tuvo capacidad en esta corrida.
     print("⏳ Sin capacidad disponible todavía en ningún dominio. Se reintentará en la próxima corrida.")
+
+    if not state["start_email_sent"]:
+        send_first_run_email(state, region, availability_domains, domain_results)
+        state["start_email_sent"] = True
+        save_state(state)
+
     raise last_capacity_error
 
 
 def main():
     state = load_state()
     availability_domains = get_availability_domains()
+    region = get_env("OCI_REGION")
 
-    # Primera corrida: registramos hora de inicio y enviamos correo de bienvenida.
+    # Primera corrida: registramos hora de inicio.
+    # OJO: el correo de "inicio" ya NO se envía aquí, sino dentro de
+    # run_attempt, después de probar los AD, para poder incluir el detalle
+    # de qué pasó en cada uno.
     if state["started_at"] is None:
         state["started_at"] = now_iso()
     state["attempts"] += 1
-
-    if not state["start_email_sent"]:
-        send_start_email(state, availability_domains)
-        state["start_email_sent"] = True
 
     # Correo de resumen cada SUMMARY_INTERVAL_HOURS horas.
     last_summary = state["last_summary_email_at"]
@@ -319,7 +359,7 @@ def main():
         and hours_since(last_summary) >= SUMMARY_INTERVAL_HOURS
     )
     if should_send_summary and not state["finished"]:
-        send_summary_email(state)
+        send_summary_email(state, region)
         state["last_summary_email_at"] = now_iso()
 
     # Guardamos el estado ya actualizado ANTES de intentar el launch, para que
@@ -330,7 +370,7 @@ def main():
 
     for attempt in range(1, NETWORK_RETRY_ATTEMPTS + 1):
         try:
-            run_attempt(config, state, availability_domains)
+            run_attempt(config, state, availability_domains, region)
             return  # run_attempt termina el proceso por sí mismo (sys.exit)
 
         except oci.exceptions.ServiceError as e:
