@@ -4,6 +4,11 @@ Script que intenta crear una instancia VM.Standard.A1.Flex (ARM, Always Free)
 en Oracle Cloud. Pensado para correr repetidamente desde GitHub Actions hasta
 que Oracle tenga capacidad disponible.
 
+Ahora valida MÚLTIPLES dominios de disponibilidad (AD) dentro de la misma
+región: si el AD 1 no tiene capacidad, prueba el AD 2, luego el AD 3, etc.
+Solo se rinde (exit code 1, para que el cron reintente en 10 min) si NINGÚN
+AD tuvo capacidad en esta corrida.
+
 Envía 3 tipos de correo (vía scripts/notify.py):
 - Inicio: una sola vez, en la primera corrida del workflow.
 - Resumen: cada ~12 horas mientras sigue intentando, con el número de intentos.
@@ -14,19 +19,17 @@ van, etc.) se guarda en scripts/state.py / state.json, que el workflow de
 GitHub Actions debe comitear de vuelta al repo tras cada corrida.
 
 Maneja tres tipos de fallo de forma distinta:
-- Sin capacidad ("Out of host capacity"): esperado, termina con exit code 1
-  para que el cron de GitHub Actions reintente en 10 minutos.
+- Sin capacidad en NINGÚN AD ("Out of host capacity"): esperado, termina con
+  exit code 1 para que el cron de GitHub Actions reintente en 10 minutos.
 - Timeout de red transitorio: reintenta unas pocas veces dentro de la misma
   corrida (con espera corta) antes de rendirse con exit code 1.
 - Cualquier otro error (credenciales, formato, etc.): error real, se imprime
   el detalle completo para depurar.
 """
-
 import os
 import sys
 import time
 import tempfile
-
 import oci
 
 from notify import send_email
@@ -47,6 +50,19 @@ def get_env(name: str) -> str:
         print(f"ERROR: falta la variable de entorno {name}")
         sys.exit(1)
     return value
+
+
+def get_availability_domains() -> list:
+    """
+    Lee OCI_AVAILABILITY_DOMAIN, que ahora puede contener uno o varios AD
+    separados por comas, ej: "XvQL:PHX-AD-1,XvQL:PHX-AD-2,XvQL:PHX-AD-3".
+    """
+    raw = get_env("OCI_AVAILABILITY_DOMAIN")
+    domains = [d.strip() for d in raw.split(",") if d.strip()]
+    if not domains:
+        print("ERROR: OCI_AVAILABILITY_DOMAIN no contiene ningún dominio válido.")
+        sys.exit(1)
+    return domains
 
 
 def build_config() -> dict:
@@ -103,11 +119,9 @@ def get_latest_ubuntu_arm_image(compute_client, compartment_id: str) -> str:
         sort_by="TIMECREATED",
         sort_order="DESC",
     ).data
-
     if not images:
         print("ERROR: no se encontró ninguna imagen Ubuntu 22.04 ARM disponible.")
         sys.exit(1)
-
     return images[0].id
 
 
@@ -140,6 +154,7 @@ def send_success_email(instance, public_ip: str, state: dict) -> None:
         f"Nombre: {instance.display_name}\n"
         f"OCID: {instance.id}\n"
         f"Estado: {instance.lifecycle_state}\n"
+        f"Dominio de disponibilidad: {instance.availability_domain}\n"
         f"IP pública: {public_ip}\n\n"
         f"Intentos totales hasta lograrlo: {state['attempts']}\n\n"
         "Próximo paso: conéctate por SSH con tu clave privada:\n"
@@ -151,13 +166,13 @@ def send_success_email(instance, public_ip: str, state: dict) -> None:
     send_email(subject, body)
 
 
-def send_start_email(state: dict) -> None:
+def send_start_email(state: dict, domains: list) -> None:
     subject = "🚀 Iniciando reintento automático de instancia Oracle ARM"
     body = (
         "Se acaba de activar el proceso de reintento automático para crear tu "
         "instancia VM.Standard.A1.Flex (4 OCPU, 24GB RAM) en Oracle Cloud.\n\n"
-        "El script intentará crear la instancia cada 10 minutos hasta que haya "
-        "capacidad disponible.\n\n"
+        f"El script intentará crear la instancia cada 10 minutos, probando "
+        f"estos dominios de disponibilidad en orden: {', '.join(domains)}\n\n"
         f"Hora de inicio (UTC): {state['started_at']}\n\n"
         f"Recibirás un correo de resumen cada {SUMMARY_INTERVAL_HOURS} horas, "
         "y un correo final cuando la instancia se cree con éxito."
@@ -172,27 +187,37 @@ def send_summary_email(state: dict) -> None:
         "Resumen del proceso de reintento automático de tu instancia Oracle ARM.\n\n"
         f"Tiempo transcurrido: {elapsed:.1f} horas\n"
         f"Intentos realizados: {state['attempts']}\n"
-        "Estado: todavía sin capacidad disponible en Oracle, el script sigue "
-        "reintentando automáticamente cada 10 minutos.\n\n"
+        "Estado: todavía sin capacidad disponible en Oracle (en ninguno de los "
+        "dominios configurados), el script sigue reintentando automáticamente "
+        "cada 10 minutos.\n\n"
         "No necesitas hacer nada, te avisaremos en cuanto se cree la instancia."
     )
     send_email(subject, body)
 
 
-def run_attempt(config: dict, state: dict):
+def run_attempt(config: dict, state: dict, availability_domains: list):
     """
-    Ejecuta un intento completo: revisar si ya existe, buscar imagen, y lanzar
-    la instancia. Si tiene éxito (instancia nueva o ya existente), envía el
-    correo de éxito y termina el proceso con sys.exit(0).
+    Ejecuta un intento completo: revisar si ya existe, buscar imagen, y luego
+    intentar lanzar la instancia probando cada AD de la lista en orden hasta
+    que uno tenga capacidad.
+
+    Si tiene éxito (instancia nueva o ya existente), envía el correo de éxito
+    y termina el proceso con sys.exit(0).
+
+    Si TODOS los AD fallan por falta de capacidad, vuelve a lanzar la última
+    excepción de "out of capacity" para que el llamador la maneje igual que
+    antes (exit code 1, reintento en 10 min vía cron).
+
+    Si algún AD falla por un error que NO es de capacidad (credenciales,
+    formato, etc.), se detiene inmediatamente y propaga ese error: no tiene
+    sentido seguir probando otros AD si el problema es, por ejemplo, un
+    subnet_id inválido.
     """
     compartment_id = get_env("OCI_TENANCY_OCID")  # compartimento raíz
     subnet_id = get_env("OCI_SUBNET_OCID")
-    availability_domain = get_env("OCI_AVAILABILITY_DOMAIN")
     display_name = os.environ.get("OCI_INSTANCE_NAME", "pasatedigital")
-
     ssh_public_key = get_env("OCI_SSH_PUBLIC_KEY").strip()
     ssh_public_key = " ".join(ssh_public_key.split())
-
     ocpus = float(os.environ.get("OCI_OCPUS", "4"))
     memory_gb = float(os.environ.get("OCI_MEMORY_GB", "24"))
     boot_volume_gb = int(os.environ.get("OCI_BOOT_VOLUME_GB", "50"))
@@ -213,55 +238,75 @@ def run_attempt(config: dict, state: dict):
     image_id = get_latest_ubuntu_arm_image(compute_client, compartment_id)
     print(f"Usando imagen: {image_id}")
 
-    launch_details = oci.core.models.LaunchInstanceDetails(
-        availability_domain=availability_domain,
-        compartment_id=compartment_id,
-        display_name=display_name,
-        shape="VM.Standard.A1.Flex",
-        shape_config=oci.core.models.LaunchInstanceShapeConfigDetails(
-            ocpus=ocpus,
-            memory_in_gbs=memory_gb,
-        ),
-        create_vnic_details=oci.core.models.CreateVnicDetails(
-            subnet_id=subnet_id,
-            assign_public_ip=True,
-        ),
-        source_details=oci.core.models.InstanceSourceViaImageDetails(
-            image_id=image_id,
-            boot_volume_size_in_gbs=boot_volume_gb,
-        ),
-        metadata={
-            "ssh_authorized_keys": ssh_public_key,
-        },
-    )
+    last_capacity_error = None
 
-    print("Intentando crear la instancia...")
-    response = compute_client.launch_instance(launch_details)
-    instance = response.data
-    print("✅ ¡Instancia creada con éxito!")
-    print(f"OCID: {instance.id}")
-    print(f"Estado: {instance.lifecycle_state}")
+    for ad in availability_domains:
+        print(f"--- Probando dominio de disponibilidad: {ad} ---")
+        launch_details = oci.core.models.LaunchInstanceDetails(
+            availability_domain=ad,
+            compartment_id=compartment_id,
+            display_name=display_name,
+            shape="VM.Standard.A1.Flex",
+            shape_config=oci.core.models.LaunchInstanceShapeConfigDetails(
+                ocpus=ocpus,
+                memory_in_gbs=memory_gb,
+            ),
+            create_vnic_details=oci.core.models.CreateVnicDetails(
+                subnet_id=subnet_id,
+                assign_public_ip=True,
+            ),
+            source_details=oci.core.models.InstanceSourceViaImageDetails(
+                image_id=image_id,
+                boot_volume_size_in_gbs=boot_volume_gb,
+            ),
+            metadata={
+                "ssh_authorized_keys": ssh_public_key,
+            },
+        )
 
-    # La IP pública puede tardar unos segundos en estar lista en la VNIC;
-    # si no aparece todavía, el correo lo indica y se puede ver en la consola.
-    public_ip = get_public_ip(compute_client, network_client, compartment_id, instance.id)
-    send_success_email(instance, public_ip, state)
-    state["finished"] = True
-    save_state(state)
-    sys.exit(0)
+        try:
+            print(f"Intentando crear la instancia en {ad}...")
+            response = compute_client.launch_instance(launch_details)
+            instance = response.data
+            print("✅ ¡Instancia creada con éxito!")
+            print(f"OCID: {instance.id}")
+            print(f"Estado: {instance.lifecycle_state}")
+            print(f"AD usado: {ad}")
+
+            # La IP pública puede tardar unos segundos en estar lista en la
+            # VNIC; si no aparece todavía, el correo lo indica.
+            public_ip = get_public_ip(compute_client, network_client, compartment_id, instance.id)
+            send_success_email(instance, public_ip, state)
+            state["finished"] = True
+            save_state(state)
+            sys.exit(0)
+
+        except oci.exceptions.ServiceError as e:
+            if is_out_of_capacity_error(e):
+                print(f"⏳ Sin capacidad en {ad}. Probando el siguiente dominio (si hay)...")
+                last_capacity_error = e
+                continue  # probar el siguiente AD
+            else:
+                # Error real (no de capacidad): no tiene sentido seguir
+                # probando otros AD, propagamos para que main() lo reporte.
+                raise
+
+    # Si llegamos aquí, ningún AD tuvo capacidad en esta corrida.
+    print("⏳ Sin capacidad disponible todavía en ningún dominio. Se reintentará en la próxima corrida.")
+    raise last_capacity_error
 
 
 def main():
     state = load_state()
+    availability_domains = get_availability_domains()
 
     # Primera corrida: registramos hora de inicio y enviamos correo de bienvenida.
     if state["started_at"] is None:
         state["started_at"] = now_iso()
-
     state["attempts"] += 1
 
     if not state["start_email_sent"]:
-        send_start_email(state)
+        send_start_email(state, availability_domains)
         state["start_email_sent"] = True
 
     # Correo de resumen cada SUMMARY_INTERVAL_HOURS horas.
@@ -285,12 +330,12 @@ def main():
 
     for attempt in range(1, NETWORK_RETRY_ATTEMPTS + 1):
         try:
-            run_attempt(config, state)
+            run_attempt(config, state, availability_domains)
             return  # run_attempt termina el proceso por sí mismo (sys.exit)
 
         except oci.exceptions.ServiceError as e:
             if is_out_of_capacity_error(e):
-                print("⏳ Sin capacidad disponible todavía. Se reintentará en la próxima corrida.")
+                # Ya se probaron todos los AD dentro de run_attempt.
                 sys.exit(1)
             else:
                 print_service_error_details(e)
