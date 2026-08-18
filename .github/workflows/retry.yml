@@ -40,8 +40,8 @@ jobs:
           OCI_AVAILABILITY_DOMAIN: ${{ secrets.OCI_AVAILABILITY_DOMAIN }}
           OCI_SSH_PUBLIC_KEY: ${{ secrets.OCI_SSH_PUBLIC_KEY }}
           OCI_INSTANCE_NAME: "pasatedigital"
-          OCI_OCPUS: "4"
-          OCI_MEMORY_GB: "24"
+          OCI_OCPUS: "2"
+          OCI_MEMORY_GB: "12"
           OCI_BOOT_VOLUME_GB: "50"
           GMAIL_ADDRESS: ${{ secrets.GMAIL_ADDRESS }}
           GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
